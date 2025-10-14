@@ -8,7 +8,7 @@ import click
 import zipfile
 from pathlib import Path
 import glob
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, WebSocket, WebSocketDisconnect
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from starlette.background import BackgroundTask
@@ -17,6 +17,8 @@ from loguru import logger
 from base64 import b64encode
 
 from mineru.cli.common import aio_do_parse, read_fn, pdf_suffixes, image_suffixes
+from mineru.cli.layout_ocr_helper import aio_layout_ocr_parse, format_layout_ocr_result
+from mineru.cli.layout_ocr_streaming import stream_layout_ocr_pages
 from mineru.utils.cli_parser import arg_parse
 from mineru.utils.guess_suffix_or_lang import guess_suffix_by_path
 from mineru.version import __version__
@@ -251,6 +253,185 @@ async def parse_pdf(
             status_code=500,
             content={"error": f"Failed to process file: {str(e)}"}
         )
+
+
+@app.post(path="/layout_ocr")
+async def layout_ocr(
+    files: List[UploadFile] = File(...),
+    output_dir: str = Form("./output"),
+    lang_list: List[str] = Form(["ch"]),
+    parse_method: str = Form("auto"),
+    include_discarded: bool = Form(False),
+    start_page_id: int = Form(0),
+    end_page_id: int = Form(99999),
+):
+    """
+    Layout OCR API Endpoint
+
+    Returns layout boxes with character-level OCR information including bbox coordinates.
+
+    Parameters:
+    - files: PDF or image files (multiple files supported)
+    - output_dir: Temporary output directory
+    - lang_list: OCR languages (ch, en, ja, ko, etc.)
+    - parse_method: Parsing method (auto/ocr/txt)
+    - include_discarded: Whether to include discarded blocks (headers/footers)
+    - start_page_id: Start page index (0-based)
+    - end_page_id: End page index (inclusive)
+
+    Returns:
+    JSON with layout boxes, bboxes, and character information
+    """
+    config = getattr(app.state, "config", {})
+
+    try:
+        # Create unique output directory
+        unique_dir = os.path.join(output_dir, str(uuid.uuid4()))
+        os.makedirs(unique_dir, exist_ok=True)
+
+        # Process uploaded files
+        pdf_file_names = []
+        pdf_bytes_list = []
+
+        for file in files:
+            content = await file.read()
+            file_path = Path(file.filename)
+
+            # Create temporary file
+            temp_path = Path(unique_dir) / file_path.name
+            with open(temp_path, "wb") as f:
+                f.write(content)
+
+            # Check file type
+            file_suffix = guess_suffix_by_path(temp_path)
+            if file_suffix in pdf_suffixes + image_suffixes:
+                try:
+                    pdf_bytes = read_fn(temp_path)
+                    pdf_bytes_list.append(pdf_bytes)
+                    pdf_file_names.append(file_path.stem)
+                    os.remove(temp_path)  # Clean up temp file
+                except Exception as e:
+                    return JSONResponse(
+                        status_code=400,
+                        content={"status": "error", "message": f"Failed to load file: {str(e)}"}
+                    )
+            else:
+                return JSONResponse(
+                    status_code=400,
+                    content={"status": "error", "message": f"Unsupported file type: {file_suffix}"}
+                )
+
+        # Set language list
+        actual_lang_list = lang_list
+        if len(actual_lang_list) != len(pdf_file_names):
+            actual_lang_list = [actual_lang_list[0] if actual_lang_list else "ch"] * len(pdf_file_names)
+
+        # Call layout_ocr parsing pipeline
+        logger.info(f"Processing {len(pdf_file_names)} file(s) with layout_ocr pipeline...")
+        middle_json_list = await aio_layout_ocr_parse(
+            output_dir=unique_dir,
+            pdf_file_names=pdf_file_names,
+            pdf_bytes_list=pdf_bytes_list,
+            p_lang_list=actual_lang_list,
+            parse_method=parse_method,
+            start_page_id=start_page_id,
+            end_page_id=end_page_id,
+            **config
+        )
+
+        # Format result
+        result = format_layout_ocr_result(
+            middle_json_list,
+            pdf_file_names,
+            include_discarded=include_discarded
+        )
+
+        return JSONResponse(
+            status_code=200,
+            content=result
+        )
+
+    except Exception as e:
+        logger.exception(e)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )
+
+
+@app.websocket("/layout_ocr/stream")
+async def layout_ocr_websocket(websocket: WebSocket):
+    """
+    WebSocket endpoint for page-by-page streaming of layout OCR results.
+
+    Protocol:
+    1. Client connects to WebSocket
+    2. Client sends JSON with parameters:
+       {
+           "pdf_base64": "...",
+           "filename": "document.pdf",
+           "lang": "ko",
+           "parse_method": "auto",
+           "include_discarded": false,
+           "start_page_id": 0,
+           "end_page_id": 99999
+       }
+    3. Server streams back JSON messages per page
+    4. Client can disconnect anytime
+    """
+    await websocket.accept()
+    config = getattr(app.state, "config", {})
+
+    try:
+        # Receive parameters from client
+        data = await websocket.receive_json()
+
+        # Extract parameters
+        pdf_base64 = data.get("pdf_base64")
+        filename = data.get("filename", "document.pdf")
+        lang = data.get("lang", "ch")
+        parse_method = data.get("parse_method", "auto")
+        include_discarded = data.get("include_discarded", False)
+        start_page_id = data.get("start_page_id", 0)
+        end_page_id = data.get("end_page_id", 99999)
+        output_dir = data.get("output_dir", "./output")
+
+        # Decode PDF
+        import base64
+        if pdf_base64:
+            pdf_bytes = base64.b64decode(pdf_base64)
+        else:
+            # Alternative: receive bytes directly
+            pdf_bytes = await websocket.receive_bytes()
+
+        # Validate file type
+        pdf_filename = Path(filename).stem
+
+        # Stream processing
+        await stream_layout_ocr_pages(
+            websocket=websocket,
+            pdf_bytes=pdf_bytes,
+            pdf_filename=pdf_filename,
+            lang=lang,
+            parse_method=parse_method,
+            include_discarded=include_discarded,
+            start_page_id=start_page_id,
+            end_page_id=end_page_id,
+            output_dir=output_dir,
+            **config
+        )
+
+    except WebSocketDisconnect:
+        logger.info("Client disconnected from WebSocket")
+    except Exception as e:
+        logger.exception(e)
+        try:
+            await websocket.send_json({
+                "status": "error",
+                "message": str(e)
+            })
+        except:
+            pass
 
 
 @click.command(context_settings=dict(ignore_unknown_options=True, allow_extra_args=True))
