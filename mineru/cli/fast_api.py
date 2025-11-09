@@ -359,6 +359,150 @@ async def layout_ocr(
         )
 
 
+@app.post(path="/layout_ocr_images")
+async def layout_ocr_images(
+    images: List[UploadFile] = File(...),
+    output_dir: str = Form("./output"),
+    lang_list: List[str] = Form(["ch"]),
+    parse_method: str = Form("auto"),
+    include_discarded: bool = Form(False),
+):
+    """
+    Layout OCR API for page images (without PDF conversion)
+
+    This endpoint accepts page images directly instead of PDFs.
+    Useful for processing specific pages or when images are already available.
+
+    Parameters:
+    - images: List of image files (one per page)
+    - output_dir: Temporary output directory
+    - lang_list: OCR languages (ch, en, ja, ko, etc.)
+    - parse_method: Parsing method (auto/ocr/txt)
+    - include_discarded: Whether to include discarded blocks (headers/footers)
+
+    Returns:
+    JSON with layout boxes, bboxes, and character information
+    """
+    config = getattr(app.state, "config", {})
+
+    try:
+        # Create unique output directory
+        unique_dir = os.path.join(output_dir, str(uuid.uuid4()))
+        os.makedirs(unique_dir, exist_ok=True)
+
+        # Load images
+        from PIL import Image
+        from mineru.cli.layout_ocr_helper import process_images_with_layout_ocr
+
+        pil_images = []
+        page_sizes = []
+        temp_files = []
+
+        logger.info(f"Processing {len(images)} page image(s) with layout_ocr...")
+
+        for idx, image_file in enumerate(images):
+            logger.info(f"  [Image {idx+1}/{len(images)}] Loading: {image_file.filename}")
+
+            # Validate image file type by extension
+            file_path = Path(image_file.filename)
+            file_suffix = file_path.suffix.lower().lstrip('.')
+
+            # Check if it's a valid image extension
+            if file_suffix not in image_suffixes:
+                # Clean up already saved temp files
+                for temp_file in temp_files:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "status": "error",
+                        "message": f"Not an image file: {image_file.filename} (type: {file_suffix})"
+                    }
+                )
+
+            # Save temporary file
+            content = await image_file.read()
+            temp_path = Path(unique_dir) / f"page_{idx}.{file_suffix}"
+            with open(temp_path, "wb") as f:
+                f.write(content)
+            temp_files.append(temp_path)
+
+            # Load PIL Image
+            try:
+                img = Image.open(temp_path)
+                # Convert to RGB if needed
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                pil_images.append(img)
+                page_sizes.append((img.width, img.height))
+                logger.info(f"    Loaded image: {img.size}")
+            except Exception as e:
+                # Clean up temp files on error
+                for temp_file in temp_files:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "status": "error",
+                        "message": f"Failed to load image {image_file.filename}: {str(e)}"
+                    }
+                )
+
+        # Set language list
+        actual_lang_list = lang_list
+        if len(actual_lang_list) != len(pil_images):
+            actual_lang_list = [actual_lang_list[0] if actual_lang_list else "ch"] * len(pil_images)
+
+        # Process with common function
+        middle_json_list = await process_images_with_layout_ocr(
+            pil_images=pil_images,
+            page_sizes=page_sizes,
+            pdf_file_names=["images"],  # Generic name
+            p_lang_list=actual_lang_list,
+            parse_method=parse_method,
+            output_dir=unique_dir,
+            start_page_id=0,
+            **config
+        )
+
+        # Format result
+        result = format_layout_ocr_result(
+            middle_json_list,
+            ["images"],
+            include_discarded=include_discarded
+        )
+
+        # Cleanup temp files
+        for temp_file in temp_files:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+        logger.info(f"All {len(images)} image(s) processed successfully")
+
+        return JSONResponse(
+            status_code=200,
+            content=result
+        )
+
+    except Exception as e:
+        logger.exception(e)
+
+        # Cleanup on error
+        if 'temp_files' in locals():
+            for temp_file in temp_files:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )
+
+
 @app.websocket("/layout_ocr/stream")
 async def layout_ocr_websocket(websocket: WebSocket):
     """

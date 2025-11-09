@@ -53,3 +53,4 @@ _build/
 output/
 
 doc_*.json
+*_layout_ocr_images_*.json

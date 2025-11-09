@@ -11,7 +11,8 @@ All custom logic is isolated here to avoid conflicts with MinerU updates.
 import copy
 import statistics
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
+from PIL import Image
 from loguru import logger
 
 
@@ -200,6 +201,280 @@ def _restore_chars_to_blocks(blocks: List[Dict[str, Any]], all_chars: List[Dict[
                         span['content'] = span.get('content', '')
 
 
+def result_to_middle_json_from_images(
+    model_list,
+    images_list,
+    image_writer,
+    lang=None,
+    ocr_enable=False,
+    formula_enabled=True
+):
+    """
+    Convert model results to middle_json format WITHOUT using pdf_doc.
+
+    This is a modified version of result_to_middle_json() that works with
+    images directly, without requiring a PDF document.
+
+    Args:
+        model_list: List of model results per page
+        images_list: List of image dictionaries
+        image_writer: Image writer for saving extracted images
+        lang: OCR language
+        ocr_enable: Enable OCR
+        formula_enabled: Enable formula detection
+
+    Returns:
+        middle_json dictionary
+    """
+    from mineru.backend.pipeline.model_json_to_middle_json import page_model_info_to_page_info
+    from mineru.backend.pipeline.model_init import AtomModelSingleton
+    from mineru.utils.config_reader import get_formula_enable
+    from mineru.version import __version__
+    from tqdm import tqdm
+
+    middle_json = {"pdf_info": [], "_backend": "pipeline", "_version_name": __version__}
+    formula_enabled = get_formula_enable(formula_enabled)
+
+    for page_index, page_model_info in tqdm(enumerate(model_list), total=len(model_list), desc="Processing pages"):
+        image_dict = images_list[page_index]
+
+        # Create a mock page object with get_size() method
+        class MockPage:
+            def __init__(self, width, height):
+                self._width = width
+                self._height = height
+
+            def get_size(self):
+                return (self._width, self._height)
+
+        # Use image dimensions instead of PDF page dimensions
+        pil_img = image_dict['img_pil']
+        mock_page = MockPage(pil_img.width, pil_img.height)
+
+        page_info = page_model_info_to_page_info(
+            page_model_info, image_dict, mock_page, image_writer,
+            page_index, ocr_enable=ocr_enable, formula_enabled=formula_enabled
+        )
+
+        if page_info is None:
+            from mineru.backend.pipeline.model_json_to_middle_json import make_page_info_dict
+            page_w, page_h = pil_img.width, pil_img.height
+            page_info = make_page_info_dict([], page_index, page_w, page_h, [])
+
+        middle_json["pdf_info"].append(page_info)
+
+    # Post-OCR processing (same as original)
+    need_ocr_list = []
+    img_crop_list = []
+    text_block_list = []
+
+    for page_info in middle_json["pdf_info"]:
+        for block in page_info['preproc_blocks']:
+            if block['type'] in ['table', 'image']:
+                for sub_block in block['blocks']:
+                    if sub_block['type'] in ['image_caption', 'image_footnote', 'table_caption', 'table_footnote']:
+                        text_block_list.append(sub_block)
+            elif block['type'] in ['text', 'title']:
+                text_block_list.append(block)
+        for block in page_info['discarded_blocks']:
+            text_block_list.append(block)
+
+    for block in text_block_list:
+        for line in block['lines']:
+            for span in line['spans']:
+                if 'np_img' in span:
+                    need_ocr_list.append(span)
+                    img_crop_list.append(span['np_img'])
+                    span.pop('np_img')
+
+    if len(img_crop_list) > 0:
+        atom_model_manager = AtomModelSingleton()
+        ocr_model = atom_model_manager.get_atom_model(
+            atom_model_name='ocr',
+            det_db_box_thresh=0.3,
+            lang=lang
+        )
+        ocr_res_list = ocr_model.ocr(img_crop_list, det=False, tqdm_enable=True)[0]
+        assert len(ocr_res_list) == len(need_ocr_list)
+
+        for span, ocr_res in zip(need_ocr_list, ocr_res_list):
+            if ocr_res is None:
+                span['content'] = ''
+            else:
+                span['content'] = ocr_res[1][0]
+
+    return middle_json
+
+
+def pdf_bytes_to_pil_images(
+    pdf_bytes: bytes,
+    start_page_id: int = 0,
+    end_page_id: int = 99999
+) -> Tuple[List[Image.Image], List[Tuple[int, int]]]:
+    """
+    Convert PDF bytes to PIL Image list.
+
+    This function converts PDF pages to PIL Images using PyMuPDF (fitz).
+    Images are rendered at 2x scale for better quality.
+
+    Args:
+        pdf_bytes: PDF file bytes
+        start_page_id: Start page index (0-based)
+        end_page_id: End page index (inclusive)
+
+    Returns:
+        Tuple of (pil_images, page_sizes)
+        - pil_images: List of PIL Image objects
+        - page_sizes: List of (width, height) tuples
+    """
+    import fitz  # PyMuPDF
+
+    pil_images = []
+    page_sizes = []
+
+    # Open PDF from bytes
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    # Apply page range
+    start_idx = max(0, start_page_id)
+    end_idx = min(len(doc), end_page_id + 1)
+
+    logger.info(f"Converting PDF pages {start_idx} to {end_idx - 1} to images...")
+
+    for page_idx in range(start_idx, end_idx):
+        page = doc[page_idx]
+
+        # Render page to image (2x scale for quality)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+
+        # Convert to PIL Image
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+        pil_images.append(img)
+        page_sizes.append((img.width, img.height))
+
+    doc.close()
+
+    logger.info(f"Converted {len(pil_images)} pages to images")
+
+    return pil_images, page_sizes
+
+
+async def process_images_with_layout_ocr(
+    pil_images: List[Image.Image],
+    page_sizes: List[Tuple[int, int]],
+    pdf_file_names: List[str],
+    p_lang_list: List[str],
+    parse_method: str,
+    output_dir: str,
+    start_page_id: int = 0,
+    **config
+) -> List[Dict[str, Any]]:
+    """
+    PIL Image 리스트를 직접 처리하여 layout_ocr 수행
+
+    ⚠️ 중요: PDF 파일을 절대 생성하지 않음
+    - batch_image_analyze()로 이미지 직접 처리
+    - restore_chars_to_middle_json() 호출 생략 (PDF 텍스트 레이어 불필요)
+    - OCR 결과에 이미 char 정보 포함되어 있음
+
+    Args:
+        pil_images: PIL Image 리스트
+        page_sizes: (width, height) 튜플 리스트
+        pdf_file_names: 파일명 리스트
+        p_lang_list: 언어 리스트
+        parse_method: auto/ocr/txt
+        output_dir: 출력 디렉토리
+        start_page_id: 시작 페이지 인덱스
+        **config: 추가 설정
+
+    Returns:
+        middle_json_list (PDF 텍스트 레이어 추출 없이)
+    """
+    from mineru.backend.pipeline.pipeline_analyze import batch_image_analyze
+    from mineru.backend.pipeline.model_json_to_middle_json import result_to_middle_json
+    from mineru.cli.common import prepare_env
+    from mineru.data.data_reader_writer import FileBasedDataWriter
+
+    logger.info(f"Processing {len(pil_images)} PIL images directly with batch_image_analyze...")
+
+    # Step 1: Prepare images with language info
+    # Format: List[Tuple[Image.Image, bool, str]]
+    images_with_extra_info = []
+    for idx, pil_img in enumerate(pil_images):
+        lang = p_lang_list[0] if len(p_lang_list) > 0 else 'ch'
+        ocr_enable = (parse_method == 'ocr' or parse_method == 'auto')
+        images_with_extra_info.append((pil_img, ocr_enable, lang))
+
+    # Step 2: Run batch_image_analyze (직접 이미지 처리, PDF 생성 안 함!)
+    logger.info("Running batch_image_analyze on PIL images...")
+    batch_results = batch_image_analyze(
+        images_with_extra_info,
+        formula_enable=True,
+        table_enable=True
+    )
+    logger.info(f"Batch analysis completed for {len(batch_results)} pages")
+
+    # Step 3: Build infer_results structure
+    # Format: infer_results[pdf_idx][page_idx] = {'layout_dets': result, 'page_info': page_info_dict}
+    infer_results = [[]]  # One file (all images belong to first file)
+
+    for page_idx, (pil_img, result) in enumerate(zip(pil_images, batch_results)):
+        page_info_dict = {
+            'page_no': page_idx,
+            'width': pil_img.width,
+            'height': pil_img.height
+        }
+        page_dict = {
+            'layout_dets': result,
+            'page_info': page_info_dict
+        }
+        infer_results[0].append(page_dict)
+
+    # Step 4: Build images_list structure
+    all_image_lists = [[]]
+    for page_idx, pil_img in enumerate(pil_images):
+        img_dict = {
+            'img_pil': pil_img,
+            'page_idx': page_idx,
+            'scale': 1.0  # 이미지 직접 처리 시 좌표 변환 불필요 (픽셀 → 픽셀)
+        }
+        all_image_lists[0].append(img_dict)
+
+    # Step 5: Generate middle_json (PDF 없이!)
+    middle_json_list = []
+    for idx, model_list in enumerate(infer_results):
+        pdf_file_name = pdf_file_names[idx] if idx < len(pdf_file_names) else 'images'
+        local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
+        image_writer = FileBasedDataWriter(local_image_dir)
+
+        images_list = all_image_lists[idx]
+        _lang = p_lang_list[idx] if idx < len(p_lang_list) else 'ch'
+        _ocr_enable = True
+
+        # Generate middle_json using PDF-free version
+        # ⚠️ result_to_middle_json_from_images() - PDF 절대 사용 안 함!
+        logger.info(f"Generating middle_json for {pdf_file_name}...")
+        middle_json = result_to_middle_json_from_images(
+            model_list, images_list, image_writer,
+            _lang, _ocr_enable, formula_enabled=True
+        )
+
+        # ⚠️ restore_chars_to_middle_json() 호출 생략!
+        # 이유: PDF 텍스트 레이어가 없으므로 불필요
+        # OCR 결과에 이미 char 정보 포함되어 있음
+
+        # Adjust page indices
+        if start_page_id > 0:
+            for page_info in middle_json.get("pdf_info", []):
+                page_info["page_idx"] += start_page_id
+
+        middle_json_list.append(middle_json)
+
+    logger.info(f"Processing completed for {len(middle_json_list)} file(s)")
+    return middle_json_list
+
+
 async def aio_layout_ocr_parse(
     output_dir: str,
     pdf_file_names: List[str],
@@ -211,14 +486,11 @@ async def aio_layout_ocr_parse(
     **kwargs,
 ) -> List[Dict[str, Any]]:
     """
-    Independent parsing pipeline for layout_ocr API.
-    Uses existing MinerU pipeline but preserves character information.
+    Independent parsing pipeline for layout_ocr API (PDF bytes input).
 
-    Strategy:
-    1. Call existing pipeline's doc_analyze for layout analysis
-    2. Call existing result_to_middle_json to generate middle_json
-    3. Re-extract chars from PDF and map to spans
-    4. Return middle_json with chars preserved
+    This function now delegates to process_images_with_layout_ocr() after
+    converting PDF bytes to PIL Images. This allows code reuse between
+    /layout_ocr and /layout_ocr_images endpoints.
 
     Args:
         output_dir: Output directory for temporary files
@@ -233,47 +505,34 @@ async def aio_layout_ocr_parse(
     Returns:
         List of middle_json dictionaries with chars information
     """
-    from mineru.backend.pipeline.pipeline_analyze import doc_analyze
-    from mineru.backend.pipeline.model_json_to_middle_json import result_to_middle_json
-    from mineru.cli.common import prepare_env, _prepare_pdf_bytes
-    from mineru.data.data_reader_writer import FileBasedDataWriter
+    from mineru.cli.common import _prepare_pdf_bytes
 
-    # Prepare PDF bytes
+    # Prepare PDF bytes (apply page range)
+    if end_page_id is None:
+        end_page_id = 99999
     pdf_bytes_list = _prepare_pdf_bytes(pdf_bytes_list, start_page_id, end_page_id)
 
-    # Run pipeline analysis (using existing function)
-    logger.info("Running layout analysis with MinerU pipeline...")
-    infer_results, all_image_lists, all_pdf_docs, lang_list, ocr_enabled_list = doc_analyze(
-        pdf_bytes_list, p_lang_list, parse_method=parse_method,
-        formula_enable=True, table_enable=True
+    # Convert PDF bytes to PIL Images
+    all_pil_images = []
+    all_page_sizes = []
+
+    for pdf_bytes in pdf_bytes_list:
+        # Note: We pass 0 and 99999 here because _prepare_pdf_bytes already applied the range
+        pil_images, page_sizes = pdf_bytes_to_pil_images(pdf_bytes, 0, 99999)
+        all_pil_images.extend(pil_images)
+        all_page_sizes.extend(page_sizes)
+
+    # Call common processing function
+    return await process_images_with_layout_ocr(
+        pil_images=all_pil_images,
+        page_sizes=all_page_sizes,
+        pdf_file_names=pdf_file_names,
+        p_lang_list=p_lang_list,
+        parse_method=parse_method,
+        output_dir=output_dir,
+        start_page_id=start_page_id,
+        **kwargs
     )
-
-    # Generate middle_json
-    middle_json_list = []
-    for idx, model_list in enumerate(infer_results):
-        pdf_file_name = pdf_file_names[idx]
-        local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
-        image_writer = FileBasedDataWriter(local_image_dir)
-
-        images_list = all_image_lists[idx]
-        pdf_doc = all_pdf_docs[idx]
-        _lang = lang_list[idx]
-        _ocr_enable = ocr_enabled_list[idx]
-
-        # Generate middle_json using existing pipeline
-        logger.info(f"Generating middle_json for {pdf_file_name}...")
-        middle_json = result_to_middle_json(
-            model_list, images_list, pdf_doc, image_writer,
-            _lang, _ocr_enable, formula_enabled=True
-        )
-
-        # ⚠️ Restore chars information
-        logger.info(f"Restoring character information for {pdf_file_name}...")
-        middle_json = restore_chars_to_middle_json(middle_json, pdf_doc)
-
-        middle_json_list.append(middle_json)
-
-    return middle_json_list
 
 
 def format_layout_ocr_result(

@@ -1085,3 +1085,688 @@ MinerU는 이미 내부적으로 캐릭터 레벨 OCR 정보를 수집하고 있
 1. Phase 1부터 순차적으로 구현 시작
 2. 각 Phase 완료 후 테스트
 3. 최종 통합 테스트 및 문서화
+
+---
+
+## 12. `/layout_ocr_images` API 추가 개발 계획
+
+### 12.1 배경 및 목적
+
+**Surya 프로젝트 참조**:
+- Surya에는 `/layout_ocr`와 `/layout_ocr_images` 두 가지 엔드포인트가 존재
+- `/layout_ocr`: PDF 파일을 입력받아 내부에서 이미지로 변환 후 처리
+- `/layout_ocr_images`: 페이지 이미지를 직접 입력받아 처리 (PDF 변환 생략)
+
+**MinerU 추가 목적**:
+1. **성능 최적화**: 특정 페이지만 재처리 시 PDF 변환 오버헤드 제거
+2. **유연성 향상**: 클라이언트가 이미 이미지를 보유한 경우 직접 사용 가능
+3. **Surya와의 일관성**: 동일한 API 인터페이스 제공
+
+### 12.2 API 명세
+
+#### 12.2.1 엔드포인트
+```
+POST /layout_ocr_images
+```
+
+#### 12.2.2 Request
+```
+Content-Type: multipart/form-data
+
+Parameters:
+- images: file[] (required)
+  - 이미지 파일 리스트 (페이지 순서대로)
+  - 지원 형식: JPG, JPEG, PNG, TIFF, BMP
+
+- lang_list: string[] (optional, default: ["ch"])
+  - OCR 언어 설정 (페이지별 또는 전체)
+
+- parse_method: string (optional, default: "auto")
+  - auto: 자동 판별
+  - ocr: OCR 강제
+  - txt: 텍스트 추출만
+
+- include_discarded: boolean (optional, default: false)
+  - discarded 블록 (header/footer) 포함 여부
+
+- output_dir: string (optional, default: "./output")
+  - 임시 출력 디렉토리
+```
+
+#### 12.2.3 Response
+```json
+{
+  "status": "success",
+  "backend": "pipeline",
+  "version": "0.9.0",
+  "files": [
+    {
+      "filename": "images",
+      "pages": [
+        {
+          "page_index": 0,
+          "page_size": {"width": 1078, "height": 1445},
+          "layout_boxes": [...]
+        }
+      ]
+    }
+  ]
+}
+```
+
+**Note**: 응답 포맷은 `/layout_ocr`와 완전히 동일 (클라이언트 호환성 보장)
+
+### 12.3 구현 아키텍처
+
+#### 12.3.1 기존 `/layout_ocr`와의 차이
+
+```
+/layout_ocr:
+  PDF 업로드 → PDF→Image 변환 → process_images_with_layout_ocr() → 결과 반환
+
+/layout_ocr_images (신규):
+  Image 업로드 → process_images_with_layout_ocr() → 결과 반환
+```
+
+**핵심**: 공통 처리 함수 `process_images_with_layout_ocr()` 분리
+
+#### 12.3.2 파일 구조
+
+```
+mineru/
+├── cli/
+│   ├── fast_api.py                    # 엔드포인트 정의
+│   ├── layout_ocr_helper.py           # 공통 처리 로직 (수정)
+│   │   ├── aio_layout_ocr_parse()     # 기존 함수
+│   │   ├── format_layout_ocr_result() # 기존 함수
+│   │   └── process_images_with_layout_ocr()  # 신규 함수 (공통)
+│   └── layout_ocr_streaming.py        # WebSocket 처리 (기존)
+└── utils/
+    └── image_utils.py                 # 이미지 처리 유틸 (신규, 필요시)
+```
+
+### 12.4 구현 순서
+
+#### Phase 1: 공통 처리 로직 분리
+
+**작업 파일**: `mineru/cli/layout_ocr_helper.py`
+
+**핵심 원칙**:
+- ❌ **절대 PDF 생성하지 않음** - 이미지 입력은 이미지 그대로 처리
+- ❌ **PDF 텍스트 레이어 추출 생략** - `restore_chars_to_middle_json()` 호출 안 함
+- ✅ **PIL Image 직접 처리** - `batch_image_analyze()` 직접 호출
+- ✅ **Surya 포맷과 동일한 결과** - MinerU가 Surya 포맷에 맞춤
+
+**1) `process_images_with_layout_ocr()` 함수 완전 재작성**
+
+```python
+async def process_images_with_layout_ocr(
+    pil_images: List[Image.Image],
+    page_sizes: List[Tuple[int, int]],
+    pdf_file_names: List[str],
+    p_lang_list: List[str],
+    parse_method: str,
+    output_dir: str,
+    start_page_id: int = 0,
+    **config
+) -> List[Dict[str, Any]]:
+    """
+    PIL Image 리스트를 직접 처리하여 layout_ocr 수행
+
+    ⚠️ 중요: PDF 파일을 절대 생성하지 않음
+    - batch_image_analyze()로 이미지 직접 처리
+    - restore_chars_to_middle_json() 호출 생략 (PDF 텍스트 레이어 불필요)
+    - OCR 결과에 이미 char 정보 포함되어 있음
+
+    Args:
+        pil_images: PIL Image 리스트
+        page_sizes: (width, height) 튜플 리스트
+        pdf_file_names: 파일명 리스트
+        p_lang_list: 언어 리스트
+        parse_method: auto/ocr/txt
+        output_dir: 출력 디렉토리
+        start_page_id: 시작 페이지 인덱스
+        **config: 추가 설정
+
+    Returns:
+        middle_json_list (PDF 텍스트 레이어 추출 없이)
+    """
+    from mineru.backend.pipeline.pipeline_analyze import batch_image_analyze
+    from mineru.backend.pipeline.model_json_to_middle_json import result_to_middle_json
+    from mineru.cli.common import prepare_env
+    from mineru.data.data_reader_writer import FileBasedDataWriter
+
+    # Step 1: Prepare images with language info
+    # Format: List[Tuple[Image.Image, bool, str]]
+    images_with_extra_info = []
+    for idx, pil_img in enumerate(pil_images):
+        lang = p_lang_list[0] if len(p_lang_list) > 0 else 'ch'
+        ocr_enable = (parse_method == 'ocr' or parse_method == 'auto')
+        images_with_extra_info.append((pil_img, ocr_enable, lang))
+
+    # Step 2: Run batch_image_analyze (직접 이미지 처리, PDF 생성 안 함!)
+    batch_results = batch_image_analyze(
+        images_with_extra_info,
+        formula_enable=True,
+        table_enable=True
+    )
+
+    # Step 3: Build infer_results structure
+    infer_results = [[]]
+    for page_idx, (pil_img, result) in enumerate(zip(pil_images, batch_results)):
+        page_info_dict = {
+            'page_no': page_idx,
+            'width': pil_img.width,
+            'height': pil_img.height
+        }
+        page_dict = {
+            'layout_dets': result,
+            'page_info': page_info_dict
+        }
+        infer_results[0].append(page_dict)
+
+    # Step 4: Build images_list structure
+    all_image_lists = [[]]
+    for page_idx, pil_img in enumerate(pil_images):
+        img_dict = {
+            'img_pil': pil_img,
+            'page_idx': page_idx
+        }
+        all_image_lists[0].append(img_dict)
+
+    # Step 5: Generate middle_json (PDF 없이!)
+    middle_json_list = []
+    for idx, model_list in enumerate(infer_results):
+        pdf_file_name = pdf_file_names[idx] if idx < len(pdf_file_names) else 'images'
+        local_image_dir, local_md_dir = prepare_env(output_dir, pdf_file_name, parse_method)
+        image_writer = FileBasedDataWriter(local_image_dir)
+
+        images_list = all_image_lists[idx]
+        _lang = p_lang_list[idx] if idx < len(p_lang_list) else 'ch'
+        _ocr_enable = True
+
+        # Generate middle_json
+        # ⚠️ pdf_doc=None 전달 (PDF 없음!)
+        middle_json = result_to_middle_json(
+            model_list, images_list, None,  # pdf_doc=None!
+            image_writer, _lang, _ocr_enable,
+            formula_enabled=True
+        )
+
+        # ⚠️ restore_chars_to_middle_json() 호출 생략!
+        # 이유: PDF 텍스트 레이어가 없으므로 불필요
+        # OCR 결과에 이미 char 정보 포함되어 있음
+
+        # Adjust page indices
+        if start_page_id > 0:
+            for page_info in middle_json.get("pdf_info", []):
+                page_info["page_idx"] += start_page_id
+
+        middle_json_list.append(middle_json)
+
+    return middle_json_list
+```
+
+**2) `pdf_bytes_to_pil_images()` Helper 함수 추가**
+
+```python
+def pdf_bytes_to_pil_images(
+    pdf_bytes: bytes,
+    start_page_id: int = 0,
+    end_page_id: int = 99999
+) -> Tuple[List[Image.Image], List[Tuple[int, int]]]:
+    """
+    PDF 바이트를 PIL Image 리스트로 변환
+
+    Args:
+        pdf_bytes: PDF 파일 바이트
+        start_page_id: 시작 페이지 인덱스
+        end_page_id: 종료 페이지 인덱스
+
+    Returns:
+        (pil_images, page_sizes) 튜플
+    """
+    import fitz  # PyMuPDF
+    from PIL import Image
+
+    pil_images = []
+    page_sizes = []
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    start_idx = max(0, start_page_id)
+    end_idx = min(len(doc), end_page_id + 1)
+
+    for page_idx in range(start_idx, end_idx):
+        page = doc[page_idx]
+
+        # Render page to image (2x scale for quality)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+
+        # Convert to PIL Image
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+        pil_images.append(img)
+        page_sizes.append((img.width, img.height))
+
+    doc.close()
+
+    return pil_images, page_sizes
+```
+
+**3) 기존 `aio_layout_ocr_parse()` 리팩토링**
+
+```python
+async def aio_layout_ocr_parse(
+    output_dir,
+    pdf_file_names: list[str],
+    pdf_bytes_list: list[bytes],
+    p_lang_list: list[str],
+    parse_method="auto",
+    start_page_id=0,
+    end_page_id=None,
+    **kwargs,
+):
+    """
+    기존 함수 - PDF 바이트를 입력받음
+
+    내부적으로 pdf_bytes_to_pil_images() + process_images_with_layout_ocr() 호출
+    """
+    # PDF → PIL Images 변환
+    all_pil_images = []
+    all_page_sizes = []
+
+    for pdf_bytes in pdf_bytes_list:
+        pil_images, page_sizes = pdf_bytes_to_pil_images(
+            pdf_bytes, start_page_id, end_page_id
+        )
+        all_pil_images.extend(pil_images)
+        all_page_sizes.extend(page_sizes)
+
+    # 공통 처리 함수 호출
+    return await process_images_with_layout_ocr(
+        pil_images=all_pil_images,
+        page_sizes=all_page_sizes,
+        pdf_file_names=pdf_file_names,
+        p_lang_list=p_lang_list,
+        parse_method=parse_method,
+        output_dir=output_dir,
+        **kwargs
+    )
+```
+
+#### Phase 2: `/layout_ocr_images` 엔드포인트 추가 (1일)
+
+**작업 파일**: `mineru/cli/fast_api.py`
+
+**위치**: `/layout_ocr` 엔드포인트 직후 (약 360행)
+
+```python
+@app.post(path="/layout_ocr_images")
+async def layout_ocr_images(
+    images: List[UploadFile] = File(...),
+    output_dir: str = Form("./output"),
+    lang_list: List[str] = Form(["ch"]),
+    parse_method: str = Form("auto"),
+    include_discarded: bool = Form(False),
+):
+    """
+    Layout OCR API for page images (without PDF conversion)
+
+    This endpoint accepts page images directly instead of PDFs.
+    Useful for processing specific pages or when images are already available.
+
+    Parameters:
+    - images: List of image files (one per page)
+    - output_dir: Temporary output directory
+    - lang_list: OCR languages (ch, en, ja, ko, etc.)
+    - parse_method: Parsing method (auto/ocr/txt)
+    - include_discarded: Whether to include discarded blocks
+
+    Returns:
+    JSON with layout boxes, bboxes, and character information
+    """
+    config = getattr(app.state, "config", {})
+
+    try:
+        # Create unique output directory
+        unique_dir = os.path.join(output_dir, str(uuid.uuid4()))
+        os.makedirs(unique_dir, exist_ok=True)
+
+        # Load images
+        from PIL import Image
+        from mineru.cli.layout_ocr_helper import process_images_with_layout_ocr
+
+        pil_images = []
+        page_sizes = []
+        temp_files = []
+
+        logger.info(f"Processing {len(images)} page image(s) with layout_ocr...")
+
+        for idx, image_file in enumerate(images):
+            logger.info(f"  [Image {idx+1}/{len(images)}] Loading: {image_file.filename}")
+
+            # Validate image file type
+            file_suffix = guess_suffix_by_path(Path(image_file.filename))
+            if file_suffix not in image_suffixes:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "status": "error",
+                        "message": f"Not an image file: {image_file.filename}"
+                    }
+                )
+
+            # Save temporary file
+            content = await image_file.read()
+            temp_path = Path(unique_dir) / f"page_{idx}.{file_suffix}"
+            with open(temp_path, "wb") as f:
+                f.write(content)
+            temp_files.append(temp_path)
+
+            # Load PIL Image
+            img = Image.open(temp_path)
+            pil_images.append(img)
+            page_sizes.append((img.width, img.height))
+            logger.info(f"    Loaded image: {img.size}")
+
+        # Set language list
+        actual_lang_list = lang_list
+        if len(actual_lang_list) != len(pil_images):
+            actual_lang_list = [actual_lang_list[0] if actual_lang_list else "ch"] * len(pil_images)
+
+        # Process with common function
+        middle_json_list = await process_images_with_layout_ocr(
+            pil_images=pil_images,
+            page_sizes=page_sizes,
+            pdf_file_names=["images"],  # Generic name
+            p_lang_list=actual_lang_list,
+            parse_method=parse_method,
+            output_dir=unique_dir,
+            **config
+        )
+
+        # Format result
+        result = format_layout_ocr_result(
+            middle_json_list,
+            ["images"],
+            include_discarded=include_discarded
+        )
+
+        # Cleanup temp files
+        for temp_file in temp_files:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+
+        logger.info(f"All {len(images)} image(s) processed successfully")
+
+        return JSONResponse(
+            status_code=200,
+            content=result
+        )
+
+    except Exception as e:
+        logger.exception(e)
+
+        # Cleanup on error
+        if 'temp_files' in locals():
+            for temp_file in temp_files:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": str(e)}
+        )
+```
+
+#### Phase 3: 테스트 및 검증 (1일)
+
+**1) 단위 테스트**
+
+```bash
+# 단일 이미지
+curl -X POST http://localhost:8000/layout_ocr_images \
+  -F "images=@page_0.jpg" \
+  -F "lang_list=en"
+
+# 여러 이미지
+curl -X POST http://localhost:8000/layout_ocr_images \
+  -F "images=@page_0.jpg" \
+  -F "images=@page_1.jpg" \
+  -F "images=@page_2.jpg" \
+  -F "lang_list=ko"
+
+# include_discarded 옵션
+curl -X POST http://localhost:8000/layout_ocr_images \
+  -F "images=@page_0.jpg" \
+  -F "include_discarded=true"
+```
+
+**2) 응답 검증**
+
+- `/layout_ocr`와 동일한 JSON 구조 확인
+- `layout_boxes`, `bbox`, `lines`, `characters` 필드 존재 확인
+- `page_index` 순서 확인 (0부터 시작)
+
+**3) 성능 비교**
+
+```python
+# /layout_ocr (PDF 입력)
+시간 = PDF 변환 (1-2초/페이지) + Layout Detection + OCR
+
+# /layout_ocr_images (이미지 입력)
+시간 = Layout Detection + OCR
+
+# 예상 개선: 페이지당 1-2초 절약
+```
+
+**4) Edge Case 테스트**
+
+- 빈 이미지
+- 매우 큰 이미지 (>10MB)
+- 다양한 형식 (JPG, PNG, TIFF)
+- 다양한 언어 (ch, en, ja, ko)
+
+#### Phase 4: 문서화 (0.5일)
+
+**1) API 문서 업데이트**
+
+- Swagger/OpenAPI 스키마 추가
+- 사용 예제 작성
+
+**2) README 업데이트**
+
+```markdown
+## API Endpoints
+
+### POST /layout_ocr_images
+
+Layout detection + OCR for page images (without PDF conversion).
+
+**Use case**: Processing specific pages or when images are already available.
+
+**Request**:
+- `images`: List of image files (JPG, PNG, TIFF, BMP)
+- `lang_list`: OCR languages (default: ["ch"])
+- `parse_method`: auto/ocr/txt (default: "auto")
+- `include_discarded`: Include header/footer boxes (default: false)
+
+**Response**: Same format as `/layout_ocr`
+
+**Example**:
+```bash
+curl -X POST http://localhost:8000/layout_ocr_images \
+  -F "images=@page_0.jpg" \
+  -F "images=@page_1.jpg" \
+  -F "lang_list=en"
+```
+```
+
+### 12.5 주의사항
+
+#### 12.5.1 메모리 관리
+
+**이슈**:
+- 여러 대용량 이미지를 동시에 메모리에 로드
+- PIL Image 객체는 메모리 사용량이 큼
+
+**해결 방안**:
+1. 이미지 크기 제한 (예: 최대 10MB/이미지)
+2. 배치 크기 제한 (예: 최대 50페이지/요청)
+3. 처리 후 즉시 메모리 해제
+
+```python
+# 이미지 크기 검증
+MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10MB
+
+content = await image_file.read()
+if len(content) > MAX_IMAGE_SIZE:
+    return JSONResponse(
+        status_code=400,
+        content={"status": "error", "message": "Image too large"}
+    )
+```
+
+#### 12.5.2 임시 파일 정리
+
+**중요**: 에러 발생 시에도 임시 파일 반드시 삭제
+
+```python
+temp_files = []
+try:
+    # ... processing ...
+    pass
+except Exception as e:
+    # ... error handling ...
+    raise
+finally:
+    # Cleanup
+    for temp_file in temp_files:
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+```
+
+#### 12.5.3 이미지 형식 지원
+
+**지원 형식**: `image_suffixes` 변수 활용
+- JPG, JPEG
+- PNG
+- TIFF, TIF
+- BMP
+
+**검증 방식**:
+```python
+file_suffix = guess_suffix_by_path(Path(image_file.filename))
+if file_suffix not in image_suffixes:
+    # Error: unsupported format
+```
+
+#### 12.5.4 API 호환성
+
+**필수 요구사항**:
+- 응답 포맷은 `/layout_ocr`와 **완전히 동일**
+- 클라이언트 코드 수정 없이 호환
+- `status`, `backend`, `version`, `files`, `pages` 구조 유지
+
+### 12.6 예상 작업 기간
+
+| Phase | 작업 내용 | 예상 시간 |
+|-------|----------|----------|
+| Phase 1 | 공통 처리 로직 분리 | 1일 |
+| Phase 2 | `/layout_ocr_images` 엔드포인트 추가 | 1일 |
+| Phase 3 | 테스트 및 검증 | 1일 |
+| Phase 4 | 문서화 | 0.5일 |
+| **총계** | | **3.5일** |
+
+### 12.7 사용 예시
+
+#### 12.7.1 Python 클라이언트
+
+```python
+import requests
+
+# 페이지 이미지 준비
+image_files = ["page_0.jpg", "page_1.jpg", "page_2.jpg"]
+
+# API 호출
+url = "http://localhost:8000/layout_ocr_images"
+files = [("images", open(img, "rb")) for img in image_files]
+data = {
+    "lang_list": ["en"],
+    "parse_method": "auto",
+    "include_discarded": False
+}
+
+response = requests.post(url, files=files, data=data)
+result = response.json()
+
+# 결과 처리
+for page in result["files"][0]["pages"]:
+    print(f"Page {page['page_index']}: {len(page['layout_boxes'])} boxes")
+
+    for box in page["layout_boxes"]:
+        print(f"  Box {box['box_id']}: {box['box_type']}")
+        for line in box["lines"]:
+            print(f"    Line: {line['text']}")
+```
+
+#### 12.7.2 cURL
+
+```bash
+# 단일 이미지
+curl -X POST http://localhost:8000/layout_ocr_images \
+  -F "images=@page_0.jpg" \
+  -F "lang_list=en" \
+  | jq '.files[0].pages[0].layout_boxes'
+
+# 여러 이미지 + 옵션
+curl -X POST http://localhost:8000/layout_ocr_images \
+  -F "images=@page_0.jpg" \
+  -F "images=@page_1.jpg" \
+  -F "images=@page_2.jpg" \
+  -F "lang_list=ko" \
+  -F "parse_method=ocr" \
+  -F "include_discarded=true" \
+  | jq '.files[0].pages[] | {page: .page_index, boxes: (.layout_boxes | length)}'
+```
+
+### 12.8 성능 비교
+
+| API | 입력 | PDF 변환 | Layout Detection | OCR | 총 시간 (10페이지) |
+|-----|------|----------|------------------|-----|-------------------|
+| `/layout_ocr` | PDF | 10-20초 | 50-100초 | 100-200초 | **160-320초** |
+| `/layout_ocr_images` | 이미지 | 0초 | 50-100초 | 100-200초 | **150-300초** |
+
+**예상 개선**: 페이지당 1-2초 절약 (PDF 변환 오버헤드 제거)
+
+### 12.9 향후 개선 사항
+
+**단기** (1-2주):
+- [ ] 이미지 크기 자동 조정 (메모리 최적화)
+- [ ] 배치 처리 병렬화
+- [ ] 진행률 추적 API
+
+**중기** (1-2개월):
+- [ ] WebSocket 스트리밍 지원 (`/layout_ocr_images/stream`)
+- [ ] Base64 인코딩 이미지 지원
+- [ ] 캐싱 메커니즘
+
+**장기** (3-6개월):
+- [ ] 다양한 이미지 전처리 옵션
+- [ ] 클라우드 스토리지 연동
+- [ ] 분산 처리 지원
+
+---
+
+## 13. 최종 결론
+
+MinerU `/layout_ocr` API는 성공적으로 구현되었으며, 이제 `/layout_ocr_images` API를 추가하여:
+
+1. ✅ **성능 최적화**: PDF 변환 생략으로 처리 시간 단축
+2. ✅ **유연성 향상**: 이미지 직접 입력 지원
+3. ✅ **Surya와 일관성**: 동일한 API 인터페이스 제공
+4. ✅ **클라이언트 호환성**: 동일한 응답 포맷 유지
+
+**예상 작업 기간**: 3.5일
+**핵심 원칙**: 기존 코드 재사용, 공통 로직 분리, API 호환성 보장
