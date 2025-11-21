@@ -577,11 +577,12 @@ def format_layout_ocr_result(
             }
 
             box_id = 0
+            page_height = page_info["page_size"][1]  # Get page height for bbox conversion
 
             # Process main blocks (para_blocks or preproc_blocks)
             blocks = page_info.get("para_blocks") or page_info.get("preproc_blocks", [])
             for block in blocks:
-                layout_box = format_block_to_layout_box(block, box_id)
+                layout_box = format_block_to_layout_box(block, box_id, page_height)
                 if layout_box:
                     page_data["layout_boxes"].append(layout_box)
                     box_id += 1
@@ -590,7 +591,7 @@ def format_layout_ocr_result(
             if include_discarded:
                 page_data["discarded_boxes"] = []
                 for block in page_info.get("discarded_blocks", []):
-                    layout_box = format_block_to_layout_box(block, box_id)
+                    layout_box = format_block_to_layout_box(block, box_id, page_height)
                     if layout_box:
                         layout_box["is_discarded"] = True
                         page_data["discarded_boxes"].append(layout_box)
@@ -603,13 +604,17 @@ def format_layout_ocr_result(
     return result
 
 
-def format_block_to_layout_box(block: Dict[str, Any], box_id: int) -> Optional[Dict[str, Any]]:
+def format_block_to_layout_box(block: Dict[str, Any], box_id: int, page_height: int) -> Optional[Dict[str, Any]]:
     """
-    Convert a block to layout_box format.
+    Convert a block to layout_box format with y-axis flipped coordinates.
+
+    MinerU uses PDF coordinate system (origin at bottom-left, y increases upward).
+    This function converts to image coordinate system (origin at top-left, y increases downward).
 
     Args:
         block: Block dictionary (preproc_block or para_block)
         box_id: Box ID
+        page_height: Page height in pixels (needed for y-axis flip)
 
     Returns:
         layout_box dictionary or None if invalid
@@ -618,11 +623,24 @@ def format_block_to_layout_box(block: Dict[str, Any], box_id: int) -> Optional[D
     if not block_type:
         return None
 
+    # Convert block bbox (PDF coordinates -> Image coordinates)
+    original_bbox = block.get("bbox")
+    if original_bbox:
+        x0, y0, x1, y1 = original_bbox
+        flipped_bbox = [
+            x0,
+            page_height - y1,  # Flip y-axis
+            x1,
+            page_height - y0   # Flip y-axis
+        ]
+    else:
+        flipped_bbox = None
+
     # Basic information
     layout_box = {
         "box_id": box_id,
         "box_type": block_type,
-        "bbox": block.get("bbox"),
+        "bbox": flipped_bbox,
     }
 
     # Add group_id if present (for tables/images)
@@ -634,17 +652,43 @@ def format_block_to_layout_box(block: Dict[str, Any], box_id: int) -> Optional[D
     layout_box["lines"] = []
 
     for line_idx, line in enumerate(lines):
+        # Convert line bbox (PDF coordinates -> Image coordinates)
+        original_line_bbox = line.get("bbox")
+        if original_line_bbox:
+            lx0, ly0, lx1, ly1 = original_line_bbox
+            flipped_line_bbox = [
+                lx0,
+                page_height - ly1,  # Flip y-axis
+                lx1,
+                page_height - ly0   # Flip y-axis
+            ]
+        else:
+            flipped_line_bbox = None
+
         line_data = {
             "line_index": line.get("index", line_idx),
-            "bbox": line.get("bbox"),
+            "bbox": flipped_line_bbox,
             "spans": []
         }
 
         # Process spans
         for span in line.get("spans", []):
+            # Convert span bbox (PDF coordinates -> Image coordinates)
+            original_span_bbox = span.get("bbox")
+            if original_span_bbox:
+                sx0, sy0, sx1, sy1 = original_span_bbox
+                flipped_span_bbox = [
+                    sx0,
+                    page_height - sy1,  # Flip y-axis
+                    sx1,
+                    page_height - sy0   # Flip y-axis
+                ]
+            else:
+                flipped_span_bbox = None
+
             span_data = {
                 "type": span.get("type"),
-                "bbox": span.get("bbox"),
+                "bbox": flipped_span_bbox,
                 "score": span.get("score"),
                 "content": span.get("content", "")
             }
@@ -663,16 +707,28 @@ def format_block_to_layout_box(block: Dict[str, Any], box_id: int) -> Optional[D
                 if "latex" in span:
                     span_data["latex"] = span["latex"]
 
-            # Add characters if present
+            # Add characters if present (with y-axis flipped coordinates)
             if "chars" in span and len(span["chars"]) > 0:
-                span_data["characters"] = [
-                    {
+                span_data["characters"] = []
+                for i, char in enumerate(span["chars"]):
+                    # Convert character bbox (PDF coordinates -> Image coordinates)
+                    char_bbox = char.get("bbox")
+                    if char_bbox:
+                        cx0, cy0, cx1, cy1 = char_bbox
+                        flipped_char_bbox = [
+                            cx0,
+                            page_height - cy1,  # Flip y-axis
+                            cx1,
+                            page_height - cy0   # Flip y-axis
+                        ]
+                    else:
+                        flipped_char_bbox = None
+
+                    span_data["characters"].append({
                         "char": char["char"],
-                        "bbox": char["bbox"],
+                        "bbox": flipped_char_bbox,
                         "char_index": char.get("char_idx", i)
-                    }
-                    for i, char in enumerate(span["chars"])
-                ]
+                    })
 
             line_data["spans"].append(span_data)
 

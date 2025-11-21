@@ -194,11 +194,12 @@ def format_page_result(page_info: dict, include_discarded: bool = False) -> dict
     }
 
     box_id = 0
+    page_height = page_info["page_size"][1]  # Get page height for bbox conversion
 
     # Process main blocks
     blocks = page_info.get("para_blocks") or page_info.get("preproc_blocks", [])
     for block in blocks:
-        layout_box = format_block_to_layout_box(block, box_id)
+        layout_box = format_block_to_layout_box(block, box_id, page_height)
         if layout_box:
             page_data["layout_boxes"].append(layout_box)
             box_id += 1
@@ -207,7 +208,7 @@ def format_page_result(page_info: dict, include_discarded: bool = False) -> dict
     if include_discarded:
         page_data["discarded_boxes"] = []
         for block in page_info.get("discarded_blocks", []):
-            layout_box = format_block_to_layout_box(block, box_id)
+            layout_box = format_block_to_layout_box(block, box_id, page_height)
             if layout_box:
                 layout_box["is_discarded"] = True
                 page_data["discarded_boxes"].append(layout_box)
